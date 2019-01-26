@@ -20,14 +20,18 @@ package org.springframework.cloud.bus;
 import javax.annotation.PostConstruct;
 
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.actuate.endpoint.Endpoint;
-import org.springframework.boot.actuate.trace.TraceRepository;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.actuate.autoconfigure.endpoint.condition.ConditionalOnEnabledEndpoint;
+import org.springframework.boot.actuate.endpoint.annotation.Endpoint;
+import org.springframework.boot.actuate.trace.http.HttpTraceRepository;
+import org.springframework.boot.autoconfigure.AutoConfigureAfter;
+import org.springframework.boot.autoconfigure.AutoConfigureBefore;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
-import org.springframework.cloud.bus.endpoint.BusEndpoint;
+import org.springframework.cloud.autoconfigure.LifecycleMvcEndpointAutoConfiguration;
 import org.springframework.cloud.bus.endpoint.EnvironmentBusEndpoint;
 import org.springframework.cloud.bus.endpoint.RefreshBusEndpoint;
 import org.springframework.cloud.bus.event.AckRemoteApplicationEvent;
@@ -43,13 +47,15 @@ import org.springframework.cloud.stream.annotation.EnableBinding;
 import org.springframework.cloud.stream.annotation.Output;
 import org.springframework.cloud.stream.annotation.StreamListener;
 import org.springframework.cloud.stream.config.BindingProperties;
-import org.springframework.cloud.stream.config.ChannelBindingServiceProperties;
+import org.springframework.cloud.stream.config.BindingServiceConfiguration;
+import org.springframework.cloud.stream.config.BindingServiceProperties;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.ApplicationEventPublisherAware;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.event.EventListener;
+import org.springframework.core.env.Environment;
 import org.springframework.messaging.MessageChannel;
 import org.springframework.messaging.support.MessageBuilder;
 import org.springframework.util.AntPathMatcher;
@@ -63,24 +69,29 @@ import org.springframework.util.PathMatcher;
 @ConditionalOnBusEnabled
 @EnableBinding(SpringCloudBusClient.class)
 @EnableConfigurationProperties(BusProperties.class)
+@AutoConfigureBefore(BindingServiceConfiguration.class) // so stream bindings work properly
+@AutoConfigureAfter(LifecycleMvcEndpointAutoConfiguration.class) // so actuator endpoints have needed dependencies
 public class BusAutoConfiguration implements ApplicationEventPublisherAware {
 
 	public static final String BUS_PATH_MATCHER_NAME = "busPathMatcher";
 
-	@Autowired
-	@Output(SpringCloudBusClient.OUTPUT)
+	public static final String CLOUD_CONFIG_NAME_PROPERTY = "spring.cloud.config.name";
+
 	private MessageChannel cloudBusOutboundChannel;
 
-	@Autowired
-	private ServiceMatcher serviceMatcher;
-
-	@Autowired
-	private ChannelBindingServiceProperties bindings;
-
-	@Autowired
-	private BusProperties bus;
-
 	private ApplicationEventPublisher applicationEventPublisher;
+
+	private final ServiceMatcher serviceMatcher;
+
+	private final BindingServiceProperties bindings;
+
+	private final BusProperties bus;
+
+	public BusAutoConfiguration(ServiceMatcher serviceMatcher, BindingServiceProperties bindings, BusProperties bus) {
+		this.serviceMatcher = serviceMatcher;
+		this.bindings = bindings;
+		this.bus = bus;
+	}
 
 	@PostConstruct
 	public void init() {
@@ -92,7 +103,7 @@ public class BusAutoConfiguration implements ApplicationEventPublisherAware {
 		}
 		BindingProperties input = this.bindings.getBindings()
 				.get(SpringCloudBusClient.INPUT);
-		if (input.getDestination() == null) {
+		if (input.getDestination() == null || input.getDestination().equals(SpringCloudBusClient.INPUT)) {
 			input.setDestination(this.bus.getDestination());
 		}
 		BindingProperties outputBinding = this.bindings.getBindings()
@@ -103,7 +114,7 @@ public class BusAutoConfiguration implements ApplicationEventPublisherAware {
 		}
 		BindingProperties output = this.bindings.getBindings()
 				.get(SpringCloudBusClient.OUTPUT);
-		if (output.getDestination() == null) {
+		if (output.getDestination() == null || output.getDestination().equals(SpringCloudBusClient.OUTPUT)) {
 			output.setDestination(this.bus.getDestination());
 		}
 	}
@@ -112,6 +123,12 @@ public class BusAutoConfiguration implements ApplicationEventPublisherAware {
 	public void setApplicationEventPublisher(
 			ApplicationEventPublisher applicationEventPublisher) {
 		this.applicationEventPublisher = applicationEventPublisher;
+	}
+
+	@Autowired
+	@Output(SpringCloudBusClient.OUTPUT)
+	public void setCloudBusOutboundChannel(MessageChannel cloudBusOutboundChannel) {
+		this.cloudBusOutboundChannel = cloudBusOutboundChannel;
 	}
 
 	@EventListener(classes = RemoteApplicationEvent.class)
@@ -168,41 +185,36 @@ public class BusAutoConfiguration implements ApplicationEventPublisherAware {
 		}
 
 		@Bean
-		public ServiceMatcher serviceMatcher(@BusPathMatcher PathMatcher pathMatcher) {
-			ServiceMatcher serviceMatcher = new ServiceMatcher();
-			serviceMatcher.setMatcher(pathMatcher);
+		public ServiceMatcher serviceMatcher(@BusPathMatcher PathMatcher pathMatcher,
+				BusProperties properties, Environment environment) {
+			String[] configNames = environment.getProperty(CLOUD_CONFIG_NAME_PROPERTY,
+					String[].class, new String[] {});
+			ServiceMatcher serviceMatcher = new ServiceMatcher(pathMatcher,
+					properties.getId(), configNames);
 			return serviceMatcher;
 		}
 
 	}
 
-	@Configuration
-	@ConditionalOnClass(Endpoint.class)
-	protected static class BusEndpointConfiguration {
-		@Bean
-		public BusEndpoint busEndpoint() {
-			return new BusEndpoint();
-		}
+	@Bean
+	@ConditionalOnProperty(value = "spring.cloud.bus.refresh.enabled", matchIfMissing = true)
+	@ConditionalOnBean(ContextRefresher.class)
+	public RefreshListener refreshListener(ContextRefresher contextRefresher) {
+		return new RefreshListener(contextRefresher);
 	}
 
 	@Configuration
 	@ConditionalOnClass({ Endpoint.class, RefreshScope.class })
-	@ConditionalOnBean(ContextRefresher.class)
 	protected static class BusRefreshConfiguration {
 
-		@Bean
-		@ConditionalOnProperty(value = "spring.cloud.bus.refresh.enabled", matchIfMissing = true)
-		public RefreshListener refreshListener(ContextRefresher contextRefresher) {
-			return new RefreshListener(contextRefresher);
-		}
-
 		@Configuration
-		@ConditionalOnProperty(value = "endpoints.spring.cloud.bus.refresh.enabled", matchIfMissing = true)
+		@ConditionalOnBean(ContextRefresher.class)
 		protected static class BusRefreshEndpointConfiguration {
 			@Bean
+			@ConditionalOnEnabledEndpoint
 			public RefreshBusEndpoint refreshBusEndpoint(ApplicationContext context,
-					BusEndpoint busEndpoint) {
-				return new RefreshBusEndpoint(context, context.getId(), busEndpoint);
+					BusProperties bus) {
+				return new RefreshBusEndpoint(context, bus.getId());
 			}
 		}
 
@@ -210,13 +222,13 @@ public class BusAutoConfiguration implements ApplicationEventPublisherAware {
 
 	@Configuration
 	@ConditionalOnClass({ Endpoint.class })
-	@ConditionalOnBean(TraceRepository.class)
+	@ConditionalOnBean(HttpTraceRepository.class)
 	@ConditionalOnProperty(value = "spring.cloud.bus.trace.enabled", matchIfMissing = false)
 	protected static class BusAckTraceConfiguration {
 
 		@Bean
 		@ConditionalOnMissingBean
-		public TraceListener ackTraceListener(TraceRepository repository) {
+		public TraceListener ackTraceListener(HttpTraceRepository repository) {
 			return new TraceListener(repository);
 		}
 
@@ -234,12 +246,12 @@ public class BusAutoConfiguration implements ApplicationEventPublisherAware {
 
 		@Configuration
 		@ConditionalOnClass(Endpoint.class)
-		@ConditionalOnProperty(value = "endpoints.spring.cloud.bus.env.enabled", matchIfMissing = true)
 		protected static class EnvironmentBusEndpointConfiguration {
 			@Bean
+			@ConditionalOnEnabledEndpoint
 			public EnvironmentBusEndpoint environmentBusEndpoint(
-					ApplicationContext context, BusEndpoint busEndpoint) {
-				return new EnvironmentBusEndpoint(context, context.getId(), busEndpoint);
+					ApplicationContext context, BusProperties bus) {
+				return new EnvironmentBusEndpoint(context, bus.getId());
 			}
 		}
 	}

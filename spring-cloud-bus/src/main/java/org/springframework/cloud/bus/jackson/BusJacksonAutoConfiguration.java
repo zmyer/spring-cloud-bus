@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2017 the original author or authors.
+ * Copyright 2013-2018 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,16 +22,25 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.databind.exc.InvalidTypeIdException;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+
 import org.springframework.beans.factory.InitializingBean;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.config.BeanDefinition;
-import org.springframework.boot.autoconfigure.AutoConfigureAfter;
+import org.springframework.boot.autoconfigure.AutoConfigureBefore;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.jackson.JacksonAutoConfiguration;
 import org.springframework.cloud.bus.BusAutoConfiguration;
 import org.springframework.cloud.bus.ConditionalOnBusEnabled;
 import org.springframework.cloud.bus.endpoint.RefreshBusEndpoint;
 import org.springframework.cloud.bus.event.RemoteApplicationEvent;
 import org.springframework.cloud.bus.event.UnknownRemoteApplicationEvent;
+import org.springframework.cloud.stream.annotation.StreamMessageConverter;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.ClassPathScanningCandidateComponentProvider;
 import org.springframework.context.annotation.Configuration;
@@ -40,10 +49,6 @@ import org.springframework.messaging.Message;
 import org.springframework.messaging.converter.AbstractMessageConverter;
 import org.springframework.util.ClassUtils;
 import org.springframework.util.MimeTypeUtils;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.databind.exc.InvalidTypeIdException;
 
 /**
  * @author Spencer Gibb
@@ -54,26 +59,52 @@ import com.fasterxml.jackson.databind.exc.InvalidTypeIdException;
 @Configuration
 @ConditionalOnBusEnabled
 @ConditionalOnClass({ RefreshBusEndpoint.class, ObjectMapper.class })
-@AutoConfigureAfter(BusAutoConfiguration.class)
+@AutoConfigureBefore({ BusAutoConfiguration.class, JacksonAutoConfiguration.class})
 public class BusJacksonAutoConfiguration {
 
-	@Bean
-	@ConditionalOnMissingBean(name = "busJsonConverter")
-	public BusJacksonMessageConverter busJsonConverter() {
-		return new BusJacksonMessageConverter();
-	}
-
+	// needed in the case where @RemoteApplicationEventScan is not used
+	// otherwise RemoteApplicationEventRegistrar will register the bean
+    @Bean
+    @ConditionalOnMissingBean(name = "busJsonConverter")
+    @StreamMessageConverter
+    public AbstractMessageConverter busJsonConverter(@Autowired(required = false) ObjectMapper objectMapper) {
+        return new BusJacksonMessageConverter(objectMapper);
+    }
 }
 
 class BusJacksonMessageConverter extends AbstractMessageConverter
 		implements InitializingBean {
 
+	private static final Log log = LogFactory.getLog(BusJacksonMessageConverter.class);
+
 	private static final String DEFAULT_PACKAGE = ClassUtils
 			.getPackageName(RemoteApplicationEvent.class);
 
-	private final ObjectMapper mapper = new ObjectMapper();
+	private final ObjectMapper mapper;
+	private final boolean mapperCreated;
 
 	private String[] packagesToScan = new String[] { DEFAULT_PACKAGE };
+
+	public BusJacksonMessageConverter() {
+		this(null);
+    }
+
+    @Autowired(required = false)
+	public BusJacksonMessageConverter(ObjectMapper objectMapper) {
+		super(MimeTypeUtils.APPLICATION_JSON);
+
+		if (objectMapper != null) {
+			this.mapper = objectMapper;
+			this.mapperCreated = false;
+		} else {
+			this.mapper = new ObjectMapper();
+			this.mapperCreated = true;
+		}
+	}
+
+	public boolean isMapperCreated() {
+		return mapperCreated;
+	}
 
 	public void setPackagesToScan(String[] packagesToScan) {
 		List<String> packages = new ArrayList<>(Arrays.asList(packagesToScan));
@@ -81,10 +112,6 @@ class BusJacksonMessageConverter extends AbstractMessageConverter
 			packages.add(DEFAULT_PACKAGE);
 		}
 		this.packagesToScan = packages.toArray(new String[0]);
-	}
-
-	public BusJacksonMessageConverter() {
-		super(MimeTypeUtils.APPLICATION_JSON);
 	}
 
 	private Class<?>[] findSubTypes() {
@@ -107,6 +134,9 @@ class BusJacksonMessageConverter extends AbstractMessageConverter
 					}
 				}
 			}
+		}
+		if (log.isDebugEnabled()) {
+			log.debug("Found sub types: "+types);
 		}
 		return types.toArray(new Class<?>[0]);
 	}
@@ -136,6 +166,9 @@ class BusJacksonMessageConverter extends AbstractMessageConverter
 				} catch (InvalidTypeIdException e) {
 					return new UnknownRemoteApplicationEvent(new Object(), e.getTypeId(), ((String) payload).getBytes());
 				}
+			// workaround for https://github.com/spring-cloud/spring-cloud-stream/issues/1564
+			} else if (payload instanceof RemoteApplicationEvent) {
+				return payload;
 			}
 		}
 		catch (Exception e) {
